@@ -1,0 +1,27 @@
+{
+  "BUMI": "Bumi Resources",
+  "DEWA": "Darma Henwa",
+  "PADI": {
+    "name": "Minna Padi Investama Sekuritas",
+    "note": "Saham papan pengembangan tanpa pemegang saham pengendali (mayoritas dimiliki publik/ritel) -- pergerakan bisa cukup spekulatif."
+  },
+  "ARCI": "Archi Indonesia",
+  "PSAB": "J Resources Asia Pasifik",
+  "BULL": "Buana Lintas Lautan",
+  "NCKL": "Trimegah Bangun Persada (Harita Nickel)",
+  "BBTN": "Bank Tabungan Negara (Persero)",
+  "MEDC": "Medco Energi Internasional",
+  "INDY": "Indika Energy",
+  "ADMR": "Adaro Minerals Indonesia",
+  "TAPG": "Triputra Agro Persada",
+  "MMIX": {
+    "name": "Multi Medika Internasional",
+    "note": "Pernah kena teguran Unusual Market Activity dari BEI (April 2026) dan sempat disuspensi akibat auto-reject beruntun (Juni 2026) -- histori pergerakan sangat spekulatif."
+  },
+  "GULA": "Aman Agrindo",
+  "IMPC": "Impack Pratama Industri",
+  "BRIS": "Bank Syariah Indonesia",
+  "IRSX": "Folago Global Nusantara",
+
+  "_README": "Format entry: 'CODE': 'Nama Perusahaan'  ATAU  'CODE': {'name': '...', 'note': 'catatan spesifik kamu soal saham ini (histori bandar, UMA, dsb)'}. Ticker yang tidak ada di sini otomatis ditampilkan sebagai 'Saham <CODE>' -- tinggal tambahin baris baru kapan saja, script akan pakai otomatis di run berikutnya."
+}
