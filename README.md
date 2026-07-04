@@ -10,8 +10,8 @@ cron, GitHub Actions, dsb).
 ```bash
 pip install -r requirements.txt --break-system-packages
 
-# dependency sistem (WAJIB, di luar pip) -- ini yang render HTML jadi gambar/PDF
-sudo apt-get update && sudo apt-get install -y wkhtmltopdf
+# dependency sistem (WAJIB, di luar pip) -- Pango, dipakai WeasyPrint buat render HTML->PDF
+sudo apt-get update && sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0
 ```
 
 Kalau mau IHSG auto-fetch (opsional): `pip install yfinance`. Kalau nggak
@@ -94,20 +94,26 @@ upload file export dari DSI -> klik Generate -> preview + download muncul ->
 isi caption -> klik "Kirim Sekarang" -> masuk ke grup Telegram.
 
 ### Kenapa perlu `packages.txt`
-`wkhtmltoimage` (yang dipakai buat render infografis) itu bukan library Python,
-jadi nggak cukup taruh di `requirements.txt`. Streamlit Cloud punya mekanisme
-terpisah: apapun yang ditulis di `packages.txt` bakal di-`apt-get install`
-sebelum app-nya jalan. File `packages.txt` di sini isinya:
+WeasyPrint (yang dipakai buat render infografis) butuh Pango -- itu bukan
+library Python, jadi nggak cukup taruh di `requirements.txt`. Streamlit Cloud
+punya mekanisme terpisah: apapun yang ditulis di `packages.txt` bakal
+di-`apt-get install` sebelum app-nya jalan. File `packages.txt` di sini isinya:
 ```
-wkhtmltopdf
-xvfb
+libpango-1.0-0
+libpangoft2-1.0-0
+libharfbuzz-subset0
 ```
-`xvfb` ini jaring pengaman: `wkhtmltoimage` dibangun di atas engine yang secara
-default mengharapkan ada display (X11), padahal server cloud itu headless
-(nggak ada monitor/display). Script sudah otomatis coba mode "offscreen" dulu
-(nggak butuh xvfb), dan baru fallback ke `xvfb-run` kalau itu gagal -- jadi
-kombinasi ini aman dipasang di `packages.txt` bahkan kalau ternyata nggak
-kepake.
+Ini daftar resmi dari dokumentasi WeasyPrint untuk instalasi via wheel (paling
+ringan, nggak perlu compile). PyMuPDF (buat convert PDF->PNG) TIDAK butuh
+apt-get sama sekali -- murni wheel pip, jadi tidak nambah baris apapun di
+`packages.txt`.
+
+> **Catatan riwayat:** versi awal tool ini pakai `wkhtmltopdf`, tapi proyek itu
+> sudah mati sejak 2020 dan mulai pertengahan 2026 sudah di-**drop total** dari
+> repo apt Debian (termasuk base image Streamlit Cloud) -- bukan lagi soal
+> "butuh xvfb", tapi paketnya beneran sudah tidak ada. WeasyPrint + PyMuPDF
+> aktif di-maintain dan dependency-nya jauh lebih ringan, jadi ini bukan cuma
+> workaround sesaat.
 
 ### Kenapa ada folder `fonts/`
 Server cloud kemungkinan besar nggak punya font Poppins ter-install. Supaya
@@ -227,5 +233,5 @@ Solusinya: export ulang dari platform screenernya sebagai `.xlsx` atau `.csv`.
 - `ticker_names.json` -- database nama emiten (extendable)
 - `fonts/` -- Poppins TTF, di-embed base64 ke tiap infografis (biar konsisten di semua host)
 - `requirements.txt` -- dependency python
-- `packages.txt` -- dependency sistem buat Streamlit Cloud (wkhtmltopdf, xvfb)
+- `packages.txt` -- dependency sistem buat Streamlit Cloud (Pango, buat WeasyPrint)
 - `README.md` -- ini

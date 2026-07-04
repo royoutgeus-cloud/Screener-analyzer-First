@@ -23,14 +23,16 @@ OUTPUT (di folder --outdir, default "outputs/")
     <nama_file>_report.html -> HTML mentahnya (buat debug/edit manual)
 
 DEPENDENSI SISTEM (di luar pip)
-    wkhtmltoimage  -> paket 'wkhtmltopdf' di apt sudah termasuk wkhtmltoimage
-    Ubuntu/Debian / GitHub Actions runner:
-        sudo apt-get update && sudo apt-get install -y wkhtmltopdf fonts-open-sans
-    (font Poppins dipakai kalau ada di sistem, kalau tidak otomatis fallback
-     ke sans-serif default browser wkhtmltoimage)
+    Cuma butuh Pango (untuk WeasyPrint) -- lihat packages.txt kalau deploy di
+    Streamlit Community Cloud. Ubuntu/Debian:
+        sudo apt-get update && sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0
+    PyMuPDF (buat konversi PDF->PNG) TIDAK butuh apt sama sekali, murni wheel pip.
+    Font Poppins di-embed base64 langsung dari folder fonts/ -- nggak
+    bergantung font ter-install di OS host.
 
 DEPENDENSI PYTHON (lihat requirements.txt)
-    pandas, openpyxl, xlrd, matplotlib, pillow, pdfplumber, requests
+    pandas, openpyxl, xlrd, matplotlib, pillow, pdfplumber, requests,
+    weasyprint, pymupdf
     yfinance (OPSIONAL — kalau ada & ada koneksi internet, IHSG auto-fetch)
 
 NARASI: RULE-BASED (default) ATAU AI (opsional)
@@ -58,10 +60,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
-import shutil
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -76,6 +77,9 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 from PIL import Image
+import fitz  # PyMuPDF -- rasterisasi PDF -> PNG, tanpa dependency sistem tambahan
+from weasyprint import HTML as WeasyHTML
+from weasyprint.text.fonts import FontConfiguration
 
 # ══════════════════════════════════════════════════════════════════════════
 # KONFIGURASI — silakan diutak-atik sesuai selera / gaya trading lu
@@ -98,9 +102,12 @@ IHSG_GREEN_THRESHOLD = 1.0    # %chg IHSG >= ini -> regime GREEN (aturan overrid
 IHSG_RED_THRESHOLD   = -1.0   # %chg IHSG <= ini -> regime RED
 
 TOP_N_DEFAULT  = 5
-RENDER_SCALE_DEFAULT = 2.0    # >1 = HD asli (CSS & chart di-render ulang di resolusi lebih tinggi,
-                               # BUKAN upscale). 2.0 kira-kira setara "retina", 1.0 = standar 1080px.
-BASE_WIDTH_PX  = 1080          # lebar desain logis (referensi 1x)
+RENDER_SCALE_DEFAULT = 2.0    # >1 = HD asli (rasterisasi PDF di DPI lebih tinggi via PyMuPDF,
+                               # BUKAN upscale gambar). 2.0 kira-kira setara "retina".
+BASE_WIDTH_PX  = 1080          # lebar desain logis (referensi 1x, dalam CSS px)
+PAGE_MAX_HEIGHT_PX = 26000     # plafon tinggi halaman WeasyPrint -- lebih dari cukup untuk
+                               # laporan terpanjang sekalipun; kelebihan otomatis di-crop
+                               # setelah render (lihat render_report()).
 
 # --- AI narrative (opsional) --------------------------------------------
 GEMINI_MODEL_DEFAULT = "gemini-2.5-flash"
@@ -123,7 +130,6 @@ AI_SYSTEM_PROMPT = (
     "{\"KODE_SAHAM\": \"narasi\", ...} untuk semua kode di data -- tanpa markdown, "
     "tanpa code fence, tanpa teks apapun di luar objek JSON tsb."
 )
-PDF_DPI        = 190
 
 HERE = Path(__file__).resolve().parent
 TICKER_DB_PATH = HERE / "ticker_names.json"
@@ -667,7 +673,7 @@ CSS = """
   .eyebrow { display:inline-block; letter-spacing:2.5px; font-size:14px; font-weight:600; color:#2ee6a6;
     background:rgba(46,230,166,0.10); border:1px solid rgba(46,230,166,0.35); padding:7px 16px; border-radius:20px; margin-bottom:22px; }
   h1.title { font-size:58px; font-weight:800; line-height:1.05; letter-spacing:-1px;
-    background: linear-gradient(90deg, #ffffff 0%, #cfe0ff 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:10px; }
+    color:#f5f8fd; margin-bottom:10px; }
   .subtitle { font-size:21px; color:#9fb0c9; font-weight:500; margin-bottom:2px;}
   .subtitle b { color:#e8edf5; }
   .sourceline { font-size:14.5px; color:#5f6d84; margin-top:8px; font-weight:500;}
@@ -685,7 +691,7 @@ CSS = """
   .sec-title h2 { font-size:28px; font-weight:800; color:#f2f6fb; }
   .sec-title .desc { font-size:14.5px; color:#6b7891; font-weight:500; margin-left:6px; }
   .pick-card { border-radius:22px; padding:26px 28px; margin-bottom:16px;
-    background: linear-gradient(135deg, #101c33 0%, #0e1728 100%); border:1px solid rgba(255,255,255,0.07); position:relative; overflow:hidden; }
+    background: linear-gradient(135deg, #101c33 0%, #0e1728 100%); border:1px solid rgba(255,255,255,0.07); position:relative; }
   .pick-card.rank1 { border:1px solid rgba(46,230,166,0.45); }
   .pick-top { display:flex; align-items:center; justify-content:space-between; }
   .pick-left { display:flex; align-items:center; gap:18px; }
@@ -711,8 +717,8 @@ CSS = """
   .pick-note { margin-top:16px; font-size:14.5px; color:#aab6c9; line-height:1.55; border-top:1px solid rgba(255,255,255,0.06); padding-top:14px;}
   .pick-note b { color:#dbe4f0; }
   .warn-tag { display:inline-block; font-size:12.5px; font-weight:700; color:#f5b942; background:rgba(245,185,66,0.12); border:1px solid rgba(245,185,66,0.35); padding:3px 11px; border-radius:12px; margin-top:10px; }
-  .chart-block { border-radius:22px; overflow:hidden; margin-bottom:8px; background:#0b1220; border:1px solid rgba(255,255,255,0.07);}
-  .chart-block img { width:100%; display:block; }
+  .chart-block { border-radius:22px; margin-bottom:8px; background:#0b1220; border:1px solid rgba(255,255,255,0.07); padding:12px;}
+  .chart-block img { width:100%; display:block; border-radius:14px; }
   table.wl { width:100%; border-collapse:collapse; border-radius:18px; overflow:hidden; }
   table.wl thead th { background:rgba(255,255,255,0.05); color:#8a97ad; font-size:12.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.6px; padding:14px 14px; text-align:left; }
   table.wl tbody td { padding:15px 14px; font-size:16px; border-top:1px solid rgba(255,255,255,0.06); color:#dbe4f0;}
@@ -735,23 +741,6 @@ CSS = """
   .footer .l { font-size:13.5px; color:#5f6d84; line-height:1.6; }
   .footer .brand { font-size:15px; font-weight:800; color:#8a97ad; letter-spacing:1px;}
 """
-
-
-import re as _re
-
-
-def scale_css(css: str, factor: float) -> str:
-    """Skala semua nilai *px* di CSS dengan `factor`. Ini yang bikin output
-    beneran HD (browser me-render elemen & font di ukuran fisik lebih besar/
-    lebih rapat pixel-nya), bukan sekadar upscale gambar jadi buram."""
-    if factor == 1.0:
-        return css
-
-    def _repl(m):
-        val = float(m.group(1))
-        return f"{val * factor:.2f}px"
-
-    return _re.sub(r"(-?\d+(?:\.\d+)?)px", _repl, css)
 
 
 def _fmt_price(v: float) -> str:
@@ -943,9 +932,7 @@ def _font_b64(filename: str) -> str:
 
 def build_font_face_css() -> str:
     """@font-face dengan font di-embed base64 langsung -- supaya tampilan
-    identik di mesin manapun (nggak bergantung font ter-install di OS host),
-    dan supaya kebal dari scale_css() (base64 lolos dari regex px scaling
-    karena block ini digabung TERPISAH, tidak ikut di-scale)."""
+    identik di mesin manapun (nggak bergantung font ter-install di OS host)."""
     faces = []
     for fname, weight in [("Poppins-Regular.ttf", 400), ("Poppins-Medium.ttf", 500), ("Poppins-Bold.ttf", 700)]:
         b64 = _font_b64(fname)
@@ -960,8 +947,18 @@ def build_font_face_css() -> str:
     return "\n".join(faces)
 
 
+def build_page_css(width_px: int = BASE_WIDTH_PX) -> str:
+    """@page terpisah dari CSS utama (yang isinya string biasa penuh kurung
+    kurawal literal) supaya gampang di-generate dinamis tanpa perlu bikin
+    seluruh CSS jadi f-string. Tinggi dibikin sangat generous (lihat
+    PAGE_MAX_HEIGHT_PX) karena WeasyPrint itu paged-media renderer -- kalau
+    kontennya lebih tinggi dari @page, dia bakal mecah jadi banyak halaman
+    kayak dokumen cetak. Kelebihan tinggi di-crop otomatis pas render."""
+    return f"@page {{ size: {width_px}px {PAGE_MAX_HEIGHT_PX}px; margin: 0; }}"
+
+
 def build_html(df: pd.DataFrame, ticker_db: dict, mkt: MarketContext, meta: dict,
-                top_n: int, chart_files: dict, scale: float = 1.0,
+                top_n: int, chart_files: dict,
                 ai_narratives: dict = None, ai_label: str = None) -> str:
     top_df = df.head(top_n)
     top_codes = set(top_df["code"])
@@ -997,11 +994,12 @@ def build_html(df: pd.DataFrame, ticker_db: dict, mkt: MarketContext, meta: dict
     <tbody>{table_rows}</tbody>
   </table>"""
 
-    scaled_css = scale_css(CSS, scale)
     font_css = build_font_face_css()
+    page_css = build_page_css(BASE_WIDTH_PX)
     return f"""<!DOCTYPE html>
 <html lang="id"><head><meta charset="UTF-8"><style>{font_css}
-{scaled_css}</style></head>
+{page_css}
+{CSS}</style></head>
 <body><div class="wrap">
 
   <div class="eyebrow">{meta['eyebrow']}</div>{ai_badge}
@@ -1045,60 +1043,91 @@ def build_html(df: pd.DataFrame, ticker_db: dict, mkt: MarketContext, meta: dict
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 8) RENDER: HTML -> PNG (HD) -> PDF
+# 8) RENDER: HTML -> PDF (WeasyPrint) -> crop ke tinggi konten -> PNG HD (PyMuPDF)
 # ══════════════════════════════════════════════════════════════════════════
+#
+# Kenapa bukan wkhtmltopdf/wkhtmltoimage lagi: proyek itu MATI sejak 2020 dan
+# beberapa distro (termasuk base image Streamlit Community Cloud per pertengahan
+# 2026) sudah BUANG paketnya dari apt sama sekali -- bukan cuma butuh xvfb, tapi
+# betul-betul "Package has no installation candidate". WeasyPrint aktif
+# di-develop, dependency sistemnya jauh lebih ringan (cuma Pango), dan
+# PyMuPDF adalah wheel pip murni (nggak butuh apt sama sekali) buat konversi
+# PDF -> PNG. Kombinasi ini juga menghilangkan seluruh masalah "butuh X11
+# display" yang selalu menghantui wkhtmltopdf di server headless.
+#
+# WeasyPrint itu paged-media renderer (didesain buat cetak/PDF berhalaman),
+# bukan continuous-viewport renderer kayak browser. Makanya CSS @page dikasih
+# tinggi yang sangat generous (PAGE_MAX_HEIGHT_PX) supaya seluruh konten laporan
+# muat di SATU halaman (nggak kepotong-potong kayak dokumen bersambung), lalu
+# kelebihan ruang kosong di bawah di-crop otomatis berdasarkan tinggi konten
+# yang sebenarnya -- baik untuk PDF (mediabox-nya dipangkas) maupun PNG.
 
-def render_html_to_png(html_path: Path, png_path: Path, width: int):
-    """Render HTML -> PNG di `width` piksel PERSIS (HTML yang dikirim ke sini
-    harus sudah di-build dengan CSS yang di-scale ke lebar yang sama -- lihat
-    generate_report(). Sengaja TIDAK pakai flag --zoom wkhtmltoimage: pada
-    banyak build, --zoom cuma stretch horizontal tanpa reflow vertikal yang
-    benar, hasilnya distorsi. Scaling asli dilakukan di level CSS + dpi chart.
+_BG_RGB = (0x07, 0x0c, 0x16)  # harus sama dengan warna body paling luar di CSS
 
-    HEADLESS SERVER (Streamlit Cloud/Railway/GitHub Actions/Docker) note:
-    wkhtmltoimage dibangun di atas Qt/WebKit yang secara default expect ada
-    X11 display. Di server headless itu nggak ada -> kita paksa Qt pakai
-    platform 'offscreen' (nggak butuh X server sama sekali). Kalau itu masih
-    gagal di suatu sistem yang wkhtmltopdf-nya dibangun tanpa dukungan
-    offscreen, kita fallback ke xvfb-run (virtual display) kalau tersedia."""
-    if shutil.which("wkhtmltoimage") is None:
-        raise RuntimeError(
-            "wkhtmltoimage tidak ditemukan di PATH. Install dulu:\n"
-            "  sudo apt-get update && sudo apt-get install -y wkhtmltopdf xvfb\n"
-            "(satu paket 'wkhtmltopdf' itu sudah termasuk binary wkhtmltoimage; "
-            "xvfb cuma dipakai sebagai fallback headless di beberapa build)"
-        )
-    base_cmd = [
-        "wkhtmltoimage", "--enable-local-file-access", "--disable-smart-width",
-        "--width", str(width), "--quality", "92",
-        str(html_path), str(png_path),
-    ]
-    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
-    result = subprocess.run(base_cmd, capture_output=True, text=True, env=env)
 
-    if result.returncode != 0 and not png_path.exists() and shutil.which("xvfb-run"):
-        # Fallback untuk build wkhtmltopdf yang belum dukung platform offscreen
-        result = subprocess.run(
-            ["xvfb-run", "-a", *base_cmd], capture_output=True, text=True, env=os.environ.copy()
-        )
+def _detect_content_height_pt(page: "fitz.Page", sample_width_px: int = 200) -> float:
+    """Render halaman (yang tingginya masih PAGE_MAX_HEIGHT_PX, penuh ruang
+    kosong) di resolusi RENDAH buat deteksi baris terakhir yang bukan cuma
+    warna background -- cepat & ringan memory karena cuma dipakai untuk
+    menentukan titik potong, bukan output final. Return dalam POINTS (satuan
+    native PDF/fitz) supaya langsung nyambung ke set_mediabox() tanpa
+    konversi unit lagi -- zoom di sini dihitung relatif terhadap page.rect
+    yang satuannya point, bukan pixel."""
+    zoom = sample_width_px / page.rect.width
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
+    im = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    w, h = im.size
+    px = im.load()
+    last_content_row = 0
+    tol = 10
+    for y in range(h - 1, -1, -1):
+        row_is_bg = True
+        for x in range(0, w, max(1, w // 20)):
+            r, g, b = px[x, y]
+            if abs(r - _BG_RGB[0]) > tol or abs(g - _BG_RGB[1]) > tol or abs(b - _BG_RGB[2]) > tol:
+                row_is_bg = False
+                break
+        if not row_is_bg:
+            last_content_row = y
+            break
+    content_height_pt = (last_content_row / zoom) + 45  # padding bawah ~60px (~45pt)
+    return min(content_height_pt, page.rect.height)
 
-    if result.returncode != 0 and not png_path.exists():
-        raise RuntimeError(
-            f"wkhtmltoimage gagal:\n{result.stderr}\n\n"
-            "Kalau ini jalan di server headless (Streamlit Cloud/Railway/GitHub Actions), "
-            "pastikan packages.txt / apt install juga mencakup 'xvfb', bukan cuma 'wkhtmltopdf'."
-        )
+
+def render_report(html_str: str, workdir: Path, pdf_path: Path, png_path: Path,
+                   width_px: int = BASE_WIDTH_PX, scale: float = RENDER_SCALE_DEFAULT):
+    """HTML -> pdf_path (PDF asli, mediabox dipangkas ke tinggi konten) dan
+    png_path (raster HD dari PDF yang sama, jadi dua-duanya dijamin identik)."""
+    font_config = FontConfiguration()
+    weasy_doc = WeasyHTML(string=html_str, base_url=str(workdir)).render(font_config=font_config)
+    page = weasy_doc.pages[0]
+
+    pdf_bytes = weasy_doc.write_pdf(font_config=font_config)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    fitz_page = doc[0]
+
+    content_height_pt = _detect_content_height_pt(fitz_page)
+    page_width_pt = fitz_page.rect.width
+    full_height_pt = fitz_page.rect.height
+    # Koordinat mediabox PDF itu bottom-up: konten yang tampak "di atas" secara
+    # visual sebenarnya berada di y mendekati full_height_pt, bukan mendekati 0.
+    # Makanya potongan yang dipertahankan adalah ujung ATAS (dekat full_height_pt),
+    # bukan dari y=0.
+    fitz_page.set_mediabox(fitz.Rect(0, full_height_pt - content_height_pt, page_width_pt, full_height_pt))
+
+    doc.save(pdf_path, garbage=3, deflate=True)
+
+    final_zoom = (96 / 72) * scale
+    pix = fitz_page.get_pixmap(matrix=fitz.Matrix(final_zoom, final_zoom))
+    pix.save(png_path)
+    doc.close()
 
 
 def optimize_png(png_path: Path):
     """Buang alpha channel & re-save supaya file size masuk akal buat dikirim."""
     im = Image.open(png_path).convert("RGB")
     im.save(png_path, optimize=True)
-
-
-def png_to_pdf(png_path: Path, pdf_path: Path, dpi: int = PDF_DPI):
-    im = Image.open(png_path).convert("RGB")
-    im.save(pdf_path, "PDF", resolution=dpi)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1152,22 +1181,21 @@ def generate_report(input_path: str, outdir: str = "outputs", top_n: int = TOP_N
     chart_files = make_charts(df, out_dir, scale=scale)
 
     print("[6/7] Merangkai HTML...")
-    html = build_html(df, ticker_db, mkt, meta, top_n, chart_files, scale=scale,
+    html = build_html(df, ticker_db, mkt, meta, top_n, chart_files,
                        ai_narratives=ai_narratives, ai_label=ai_label)
     html_path = out_dir / f"{in_path.stem}_report.html"
     html_path.write_text(html, encoding="utf-8")
 
-    render_width = int(BASE_WIDTH_PX * scale)
-    print(f"[7/7] Render PNG ({render_width}px, skala {scale}x) dan PDF...")
     png_path = out_dir / f"{in_path.stem}_HD.png"
-    render_html_to_png(html_path, png_path, width=render_width)
+    pdf_path = out_dir / f"{in_path.stem}.pdf" if make_pdf else out_dir / f"_tmp_{in_path.stem}.pdf"
+    print(f"[7/7] Render PDF (WeasyPrint) -> crop -> PNG HD skala {scale}x (PyMuPDF)...")
+    render_report(html, out_dir, pdf_path, png_path, width_px=BASE_WIDTH_PX, scale=scale)
     optimize_png(png_path)
 
-    result = {"html": html_path, "png": png_path, "pdf": None, "dataframe": df, "ai_backend_used": ai_used}
-    if make_pdf:
-        pdf_path = out_dir / f"{in_path.stem}.pdf"
-        png_to_pdf(png_path, pdf_path)
-        result["pdf"] = pdf_path
+    result = {"html": html_path, "png": png_path, "pdf": pdf_path if make_pdf else None,
+              "dataframe": df, "ai_backend_used": ai_used}
+    if not make_pdf and pdf_path.exists():
+        pdf_path.unlink()
 
     print("\nSelesai:")
     print(f"  PNG (HD) : {png_path}  ({png_path.stat().st_size/1024:.0f} KB)")
